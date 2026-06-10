@@ -341,18 +341,64 @@ let selectedIr = null;
 // ── OAuth / Auth ──────────────────────────────────────────────────────────────
 
 async function sha256base64url(str) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
-  return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+  if (crypto.subtle) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+    return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+  }
+  // Pure JS SHA-256 fallback for non-secure HTTP contexts
+  const bytes = new TextEncoder().encode(str);
+  const hash = await sha256Pure(bytes);
+  return btoa(String.fromCharCode(...hash)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+
+function sha256Pure(msgBytes) {
+  const K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  let h = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  const len = msgBytes.length, bitLen = len * 8;
+  const padded = new Uint8Array(Math.ceil((len + 9) / 64) * 64);
+  padded.set(msgBytes); padded[len] = 0x80;
+  new DataView(padded.buffer).setUint32(padded.length - 4, bitLen, false);
+  const r = (x,n) => (x >>> n) | (x << (32-n));
+  for (let i = 0; i < padded.length; i += 64) {
+    const w = new Array(64);
+    const dv = new DataView(padded.buffer, i, 64);
+    for (let j = 0; j < 16; j++) w[j] = dv.getUint32(j*4, false);
+    for (let j = 16; j < 64; j++) { const s0 = r(w[j-15],7)^r(w[j-15],18)^(w[j-15]>>>3), s1 = r(w[j-2],17)^r(w[j-2],19)^(w[j-2]>>>10); w[j] = (w[j-16]+s0+w[j-7]+s1)|0; }
+    let [a,b,c,d,e,f,g,hh] = h;
+    for (let j = 0; j < 64; j++) {
+      const S1 = r(e,6)^r(e,11)^r(e,25), ch = (e&f)^(~e&g), t1 = (hh+S1+ch+K[j]+w[j])|0;
+      const S0 = r(a,2)^r(a,13)^r(a,22), maj = (a&b)^(a&c)^(b&c), t2 = (S0+maj)|0;
+      hh=g; g=f; f=e; e=(d+t1)|0; d=c; c=b; b=a; a=(t1+t2)|0;
+    }
+    h = [h[0]+a,h[1]+b,h[2]+c,h[3]+d,h[4]+e,h[5]+f,h[6]+g,h[7]+hh].map(x=>x|0);
+  }
+  const out = new Uint8Array(32);
+  const odv = new DataView(out.buffer);
+  h.forEach((v,i) => odv.setUint32(i*4, v, false));
+  return out;
+}
+
+function randomHex(n) {
+  if (crypto.getRandomValues) {
+    const buf = new Uint8Array(n);
+    crypto.getRandomValues(buf);
+    return Array.from(buf).map(b => b.toString(16).padStart(2,'0')).join('');
+  }
+  return Array.from({length: n*2}, () => Math.floor(Math.random()*16).toString(16)).join('');
 }
 
 async function startAuth() {
-  const verifier = crypto.randomUUID().replace(/-/g,'') + crypto.randomUUID().replace(/-/g,'');
-  const challenge = await sha256base64url(verifier);
-  const state = crypto.randomUUID();
-  sessionStorage.setItem('t3k_verifier', verifier);
-  sessionStorage.setItem('t3k_state', state);
-  const params = new URLSearchParams({ client_id: CLIENT_ID, redirect_uri: REDIRECT_URI, response_type: 'code', code_challenge: challenge, code_challenge_method: 'S256', state });
-  window.location.href = `${API_BASE}/oauth/authorize?${params}`;
+  try {
+    const verifier = randomHex(32) + randomHex(16);
+    const challenge = await sha256base64url(verifier);
+    const state = randomHex(16);
+    sessionStorage.setItem('t3k_verifier', verifier);
+    sessionStorage.setItem('t3k_state', state);
+    const params = new URLSearchParams({ client_id: CLIENT_ID, redirect_uri: REDIRECT_URI, response_type: 'code', code_challenge: challenge, code_challenge_method: 'S256', state });
+    window.location.href = `${API_BASE}/oauth/authorize?${params}`;
+  } catch(e) {
+    showError(`Could not start login: ${e.message}. Make sure you're opening the app at http://localhost:8080/nam-tone-matcher.html`);
+  }
 }
 
 async function handleCallback() {
@@ -1168,8 +1214,8 @@ function generateTemplateString(tone, namTone, irTone) {
   { artist:"Carlos Santana", song:"Smooth", genre:"Latin Rock", icon:"", amp:"Mesa Boogie Mark I", ampSearch:"mesa boogie mark i combo", cabSearch:"mesa 1x12 ev combo", ampType:"American tube combo", gain:"medium", cab:"Mesa Boogie 1×12 (EV)", pedals:[{name:"Ibanez TS-808 Tube Screamer",type:"overdrive",reaperPlugin:"JSFX: overdrive"},{name:"Boss CE-2 Chorus",type:"chorus",reaperPlugin:"ReaDelay (chorus mode)"}], confidence:87, source:"Supernatural (1999). Santana's Mesa Boogie Mark I rig is confirmed. Smooth is one of his most documented modern recordings." },
   { artist:"Carlos Santana", song:"Maria Maria", genre:"Latin Rock", icon:"", amp:"Mesa Boogie Mark I", ampSearch:"mesa boogie mark i", cabSearch:"mesa 1x12 ev", ampType:"American tube combo", gain:"medium", cab:"Mesa Boogie 1×12 (EV)", pedals:[{name:"Ibanez TS-808 Tube Screamer",type:"overdrive",reaperPlugin:"JSFX: overdrive"}], confidence:85, source:"Supernatural (1999). Same session as Smooth. Santana's Mesa Boogie rig confirmed throughout." },
   { artist:"Carlos Santana", song:"Evil Ways", genre:"Latin Rock", icon:"", amp:"Mesa Boogie Mark I", ampSearch:"mesa boogie mark i combo", cabSearch:"mesa 1x12 ev combo", ampType:"American tube combo", gain:"medium", cab:"Mesa Boogie 1×12 (EV)", pedals:[{name:"Boss CE-2 Chorus",type:"chorus",reaperPlugin:"ReaDelay (chorus mode)"}], confidence:86, source:"Santana (1969). Santana's early Mesa Boogie Mark I tone is well documented. One of his signature tones." },
-  { artist:"Dire Straits", song:"Romeo and Juliet", genre:"Rock", icon:"", amp:"Fender Vibro Champ", ampSearch:"fender vibro champ", cabSearch:"fender 8 inch jensen c8r", ampType:"Low-watt Fender combo", gain:"low", cab:"Fender 8" Jensen C8R", pedals:[{name:"MXR Dynacomp",type:"comp",reaperPlugin:"ReaComp"}], confidence:87, source:"Making Movies (1980). Knopfler's low-watt Fender combo is documented for his clean fingerstyle approach." },
-  { artist:"Dire Straits", song:"Brothers in Arms", genre:"Rock", icon:"", amp:"Fender Vibro Champ", ampSearch:"fender vibro champ", cabSearch:"fender 8 inch jensen c8r", ampType:"Low-watt Fender combo", gain:"low", cab:"Fender 8" Jensen C8R", pedals:[], confidence:86, source:"Brothers in Arms (1985). Knopfler's clean Fender approach is very well documented by engineers Neil Dorfsman and Chuck Ainlay." },
+  { artist:"Dire Straits", song:"Romeo and Juliet", genre:"Rock", icon:"", amp:"Fender Vibro Champ", ampSearch:"fender vibro champ", cabSearch:"fender 8 inch jensen c8r", ampType:"Low-watt Fender combo", gain:"low", cab:"Fender 8\" Jensen C8R", pedals:[{name:"MXR Dynacomp",type:"comp",reaperPlugin:"ReaComp"}], confidence:87, source:"Making Movies (1980). Knopfler's low-watt Fender combo is documented for his clean fingerstyle approach." },
+  { artist:"Dire Straits", song:"Brothers in Arms", genre:"Rock", icon:"", amp:"Fender Vibro Champ", ampSearch:"fender vibro champ", cabSearch:"fender 8 inch jensen c8r", ampType:"Low-watt Fender combo", gain:"low", cab:"Fender 8\" Jensen C8R", pedals:[], confidence:86, source:"Brothers in Arms (1985). Knopfler's clean Fender approach is very well documented by engineers Neil Dorfsman and Chuck Ainlay." },
   // ── More Pink Floyd ──
   { artist:"Pink Floyd", song:"Money", genre:"Prog Rock", icon:"", amp:"Hiwatt DR103 Custom 100", ampSearch:"hiwatt dr103 custom 100", cabSearch:"wem 4x12 fane", ampType:"British clean powerhouse", gain:"medium", cab:"WEM 4×12 (Fane)", pedals:[{name:"Binson Echorec tape echo",type:"delay",reaperPlugin:"ReaDelay"},{name:"Electric Mistress Flanger",type:"flanger",reaperPlugin:"JSFX: chorus/flanger"}], confidence:93, source:"The Dark Side of the Moon (1973). Gilmour's Hiwatt DR103 is one of the most documented rigs in prog rock history." },
   { artist:"Pink Floyd", song:"Time", genre:"Prog Rock", icon:"", amp:"Hiwatt DR103 Custom 100", ampSearch:"hiwatt dr103", cabSearch:"wem 4x12 fane", ampType:"British clean powerhouse", gain:"medium", cab:"WEM 4×12 (Fane)", pedals:[{name:"Binson Echorec tape echo",type:"delay",reaperPlugin:"ReaDelay"}], confidence:92, source:"Same Dark Side of the Moon (1973) session. Gilmour's Hiwatt rig confirmed by engineer Alan Parsons." },
